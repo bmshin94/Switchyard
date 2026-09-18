@@ -90,35 +90,31 @@ pub async fn run(
     {
         observer(RunObservation::Outcome(metadata));
     }
-    let (result, answer_duration) = if let Some(response) = outcome.response {
-        (Ok(response), None)
+    let result = if let Some(response) = outcome.response {
+        let result = clients.remember_state_owner(&outcome.request, response);
+        let served_model = result
+            .as_ref()
+            .ok()
+            .and_then(Response::served_model)
+            .unwrap_or(&selected_model_id);
+        metrics::record_routed_request(served_model, None, &result);
+        result
     } else {
-        let answer_started = Instant::now();
         let observe = |observation| {
             if let Some(observer) = &observer {
                 observer(RunObservation::AnswerCall(observation));
             }
         };
-        let result = call_first_available(
+        call_first_available(
             &clients,
             &algorithm_name,
             &outcome.request,
             &outcome.selected_model_ids,
             &observe,
         )
-        .await;
-        let answer_duration = answer_started.elapsed();
-        metrics::record_answer_call(
-            &algorithm_name,
-            &selected_model_id,
-            answer_duration,
-            &result,
-        );
-        (result, Some(answer_duration))
+        .await
+        .and_then(|response| clients.remember_state_owner(&outcome.request, response))
     };
-    let result =
-        result.and_then(|response| clients.remember_state_owner(&outcome.request, response));
-    metrics::record_routed_request(&selected_model_id, answer_duration, &result);
     if let Some(observer) = &observer {
         observer(RunObservation::RoutingOverhead(overhead));
     }
@@ -322,6 +318,10 @@ async fn call_one(
         response
     });
     let result = observability::observe_client_call(result);
+    if !buffer {
+        metrics::record_answer_call(algorithm, model_id, duration, &result);
+        metrics::record_routed_request(model_id, Some(duration), &result);
+    }
     observe(LlmCallObservation {
         selected_model: model_id.clone(),
         is_success: result.is_ok(),
